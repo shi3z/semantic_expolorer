@@ -3,25 +3,27 @@
 All eight knobs are *semantic* axes: each is a direction in CLIP text-embedding
 space, built as the difference between two contrasting prompts and rescaled so every
 knob lands with comparable force. Turning a knob slides the image along that concept.
-Pads fire velocity-scaled impulses into the noise latent that decay over about half
-a second.
+Pads mutate the base noise latent for good. Each pad owns the axis of the same
+number, every hit jumps a random distance along it, and the harder you hit the
+further you go - so the image wanders somewhere new and stays there. Press r to
+start over from a fresh latent.
 
     .venv/Scripts/python.exe midi_latent.py
     .venv/Scripts/python.exe midi_latent.py --width 384 --height 384   # ~26 fps
 
 Knobs (left to right, after you have moved each one once):
-    1 man <-> woman        4 busy <-> silent      7 japanese <-> western
-    2 human <-> animal     5 new <-> old          8 organic <-> mechanic
-    3 life <-> artificial  6 photo <-> anime
+    1 man <-> woman          4 busy <-> silent      7 japanese <-> western
+    2 fantasy <-> cyberpunk  5 new <-> old          8 organic <-> mechanic
+    3 life <-> artificial    6 photo <-> anime
 
 Semantic depth is fixed at SEM_DEPTH (1.5) so every knob can be an axis.
 
-Pads: velocity-scaled latent impulses, one direction each.
+Pads: velocity-scaled permanent mutations of the base latent, one axis each.
 
 Keys in the window:
-    r  new base latent          d  toggle drift        s  save frame
-    n  new latent directions    h  toggle HUD          [ / ]  prev / next scene
-    c  recentre knobs           - / =  pad depth       q / esc  quit
+    r  reset the latent         d  toggle drift        s  save frame
+    n  new pad directions       h  toggle HUD          [ / ]  prev / next scene
+    c  recentre knobs           - / =  mutation size   q / esc  quit
 """
 import argparse
 import os
@@ -67,9 +69,12 @@ AXES = [
     ("man", "woman",
      "a portrait photograph of a man, male, masculine face",
      "a portrait photograph of a woman, female, feminine face", 100.0),
-    ("human", "animal",
-     "a portrait photograph of a person",
-     "a portrait photograph of a wolf", 62.0),
+    # Two opposite departures from the real, so centre is the unmodified scene:
+    # magic and the pre-industrial past one way, neon and the high-tech future the
+    # other. About genre and setting, not material - that is knob 8's job.
+    ("fantasy", "cyberpunk",
+     "a photograph of a fantasy world, magic, medieval, dragons, enchanted",
+     "a photograph of a cyberpunk world, neon, chrome, cybernetic, futuristic", 95.0),
     ("life", "artificial",
      "a portrait photograph of a living organic creature, flesh, alive",
      "a photograph of a machine, robot, chrome, circuitry, mechanical", 93.0),
@@ -95,8 +100,11 @@ N_PADS = 8
 
 SEM_DEPTH = 1.5      # semantic depth, fixed - all eight knobs are axes now
 SEM_GAIN = 1.0       # multiplier at knob = 1.0 and depth = 1.0
-PAD_GAIN = 2.2       # latent sigma for a full-velocity pad hit
-PAD_TAU = 0.55       # impulse decay constant, seconds
+MUT_STEP = 0.6       # how far a full-velocity hit moves the base latent
+MUT_CURVE = 1.5      # velocity exponent - soft taps nudge, hard hits leap
+MUT_JITTER = 0.7     # fresh randomness blended into the pad's own direction, so
+                     # no two hits on the same pad ever land in the same place
+PAD_TAU = 0.35       # HUD flash decay, seconds - the mutation itself is permanent
 DRIFT = 0.014        # random-walk step per frame when drift is on
 
 
@@ -125,7 +133,8 @@ class Midi:
         self.raw = {}            # cc number -> 0..127
         self.cc_slots = []       # sorted cc numbers
         self.note_slots = []     # sorted note numbers
-        self.impulses = deque()  # (slot, amp, t0)
+        self.impulses = deque()  # (slot, amp, t0) - HUD flash only
+        self.pending = deque()   # (slot, velocity) - unconsumed mutations
         self.offset = {}         # cc -> value treated as centre
         self.lock = threading.Lock()
         self._stop = False
@@ -149,7 +158,9 @@ class Midi:
                         self.note_slots = sorted(set(self.note_slots) | {msg.note})
                     slot = self.note_slots.index(msg.note)
                     if slot < N_PADS:
-                        self.impulses.append((slot, msg.velocity / 127.0, now))
+                        vel = msg.velocity / 127.0
+                        self.impulses.append((slot, vel, now))
+                        self.pending.append((slot, vel))
 
     def knob(self, slot, default=0.0):
         """Knob `slot` as -1..1 around its centre, or `default` until first moved."""
@@ -175,6 +186,16 @@ class Midi:
     def recentre(self):
         with self.lock:
             self.offset = dict(self.raw)
+
+    def take_hits(self):
+        """Drain the pad hits since the last call, as (slot, velocity) pairs.
+
+        Consuming rather than sampling matters here: a mutation must be applied
+        exactly once, however many frames the hit straddles.
+        """
+        with self.lock:
+            hits, self.pending = list(self.pending), deque()
+        return hits
 
     def pad_envelopes(self, now):
         amps = np.zeros(N_PADS, dtype=np.float32)
@@ -246,7 +267,7 @@ INK = (196, 206, 216)
 DIM = (132, 140, 150)
 
 
-def draw_hud(frame, knobs, pad_depth, amps, fps, scene, drift, saved):
+def draw_hud(frame, knobs, mut_size, amps, fps, scene, drift, saved):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h - PANEL), (w, h), (16, 13, 11), -1)
@@ -267,9 +288,11 @@ def draw_hud(frame, knobs, pad_depth, amps, fps, scene, drift, saved):
     y = top + 58
     for i, (lname, rname, *_rest) in enumerate(AXES):
         cy = y + i * row_h
+        # pad i mutates the latent along axis i - flash the labels so you can see it
+        lab = tuple(int(c + (250 - c) * float(np.clip(amps[i], 0, 1))) for c in DIM)
         (tw, _), _ = cv2.getTextSize(lname, FONT, 0.36, 1)
-        cv2.putText(frame, lname, (bar_x - 8 - tw, cy + 5), FONT, 0.36, DIM, 1, cv2.LINE_AA)
-        cv2.putText(frame, rname, (bar_x + bar_w + 8, cy + 5), FONT, 0.36, DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, lname, (bar_x - 8 - tw, cy + 5), FONT, 0.36, lab, 1, cv2.LINE_AA)
+        cv2.putText(frame, rname, (bar_x + bar_w + 8, cy + 5), FONT, 0.36, lab, 1, cv2.LINE_AA)
         cv2.rectangle(frame, (bar_x, cy - 3), (bar_x + bar_w, cy + 4), (54, 60, 68), -1)
         mid = bar_x + bar_w // 2
         v = int(knobs[i] * (bar_w // 2))
@@ -285,10 +308,10 @@ def draw_hud(frame, knobs, pad_depth, amps, fps, scene, drift, saved):
     cv2.putText(frame, f"sem {SEM_DEPTH:.1f} fixed", (rx, top + 20), FONT, 0.36,
                 (140, 200, 90), 1, cv2.LINE_AA)
     yy = top + 28
-    cv2.putText(frame, "pad", (rx, yy + 8), FONT, 0.36, DIM, 1, cv2.LINE_AA)
+    cv2.putText(frame, "mut", (rx, yy + 8), FONT, 0.36, DIM, 1, cv2.LINE_AA)
     cv2.rectangle(frame, (rx + 56, yy), (rx + 176, yy + 7), (54, 60, 68), -1)
     cv2.rectangle(frame, (rx + 56, yy),
-                  (rx + 56 + int(120 * np.clip(pad_depth / 2.0, 0, 1)), yy + 7),
+                  (rx + 56 + int(120 * np.clip(mut_size / 2.0, 0, 1)), yy + 7),
                   (90, 170, 235), -1)
 
     py = top + 60
@@ -342,12 +365,18 @@ def main():
     base = new_base()
     base_norm = base.float().norm()
     latent_dirs = orthonormal_basis(N_PADS, shape, gen, device, dtype)
+    dir_norm = latent_dirs[0].float().norm()
+
+    def renorm(z):
+        """Back onto the noise hypersphere. Mutations accumulate, and off the
+        sphere the UNet gets something it never saw in training and washes out."""
+        return (z * (base_norm / z.float().norm().clamp(min=1e-6))).to(dtype)
 
     win = "StreamDiffusion - MIDI"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
     scene_i, show_hud, drift, saved_until = 0, True, False, 0.0
-    pad_depth = 1.0          # - and = adjust; all eight knobs are spoken for
+    mut_size = 1.0          # - and = adjust; all eight knobs are spoken for
     fps, frames, t_fps = 0.0, 0, time.perf_counter()
     print("\nrunning - focus the image window for keys, ctrl-c here to stop\n")
 
@@ -365,18 +394,17 @@ def main():
                 if abs(k) > 1e-3:
                     emb = emb + (float(k) * SEM_DEPTH * SEM_GAIN) * axes[i]
 
-            # --- the noise latent carries variation and the pad hits
+            # --- pads mutate the base latent for good, one axis each
+            for slot, vel in midi.take_hits():
+                d = latent_dirs[slot] + MUT_JITTER * torch.randn(
+                    shape, generator=gen, dtype=torch.float32).to(device, dtype)
+                d = d * (dir_norm / d.float().norm().clamp(min=1e-6))
+                base = renorm(base + (vel ** MUT_CURVE) * MUT_STEP * mut_size * d)
+
             if drift:
-                base = base + DRIFT * torch.randn(base.shape, generator=gen,
-                                                  dtype=torch.float32).to(device, dtype)
-            offset = torch.zeros_like(base)
-            for i in range(N_PADS):
-                if amps[i] > 1e-3:
-                    offset = offset + float(amps[i]) * PAD_GAIN * pad_depth * latent_dirs[i]
-            latent = base + offset
-            # keep the modulated latent on the noise hypersphere, or the UNet gets
-            # something it never saw in training and the image washes out
-            latent = (latent * (base_norm / latent.float().norm().clamp(min=1e-6))).to(dtype)
+                base = renorm(base + DRIFT * torch.randn(base.shape, generator=gen,
+                                                         dtype=torch.float32).to(device, dtype))
+            latent = base
 
             frame = to_bgr(generate(sd, latent, emb.to(dtype)))
 
@@ -388,7 +416,7 @@ def main():
                 frame = cv2.resize(frame, None, fx=a.scale, fy=a.scale,
                                    interpolation=cv2.INTER_LINEAR)
             if show_hud:
-                frame = draw_hud(frame, knobs, pad_depth, amps, fps,
+                frame = draw_hud(frame, knobs, mut_size, amps, fps,
                                  SCENES[scene_i], drift, now < saved_until)
 
             cv2.imshow(win, frame)
@@ -403,9 +431,9 @@ def main():
             elif k == ord("c"):
                 midi.recentre()
             elif k == ord("-"):
-                pad_depth = max(0.0, pad_depth - 0.1)
+                mut_size = max(0.0, mut_size - 0.1)
             elif k in (ord("="), ord("+")):
-                pad_depth = min(2.0, pad_depth + 0.1)
+                mut_size = min(2.0, mut_size + 0.1)
             elif k == ord("d"):
                 drift = not drift
             elif k == ord("h"):
