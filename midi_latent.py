@@ -20,6 +20,10 @@ Semantic depth is fixed at SEM_DEPTH (1.5) so every knob can be an axis.
 
 Pads: velocity-scaled permanent mutations of the base latent, one axis each.
 
+The radar shows where the base latent sits in the 8D subspace those pads span:
+centre is untouched noise, the rim is the wall of the 8-cube, and r is how much
+of the latent the pads have taken over.
+
 Keys in the window:
     r  reset the latent         d  toggle drift        s  save frame
     n  new pad directions       h  toggle HUD          [ / ]  prev / next scene
@@ -263,11 +267,55 @@ def to_bgr(tensor):
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 PANEL = 204
+RADAR_R = 58         # radar radius, px
+RADAR_FULL = 0.5     # direction cosine drawn out at the rim
 INK = (196, 206, 216)
 DIM = (132, 140, 150)
 
 
-def draw_hud(frame, knobs, mut_size, amps, fps, scene, drift, saved):
+def draw_radar(frame, cx, cy, coords, amps):
+    """Where the base latent sits in the 8D subspace the pads span.
+
+    The latent is really 16384 numbers; these eight are its direction cosines
+    along the eight pad directions, so the rim is the wall of the 8-cube and the
+    centre is having no component at all. A fresh latent starts near dead centre
+    - a random vector in 16384 dimensions has almost nothing in any particular
+    eight of them - and each hit pushes it out along that pad's spoke.
+    """
+    R = RADAR_R
+    angs = [-np.pi / 2 + i * 2 * np.pi / N_PADS for i in range(N_PADS)]
+
+    def at(t, m):
+        return int(cx + R * m * np.cos(t)), int(cy + R * m * np.sin(t))
+
+    for m, col in ((1.0, (64, 70, 80)), (0.5, (44, 49, 57))):
+        cv2.polylines(frame, [np.array([at(t, m) for t in angs], np.int32)],
+                      True, col, 1, cv2.LINE_AA)
+    for t in angs:
+        cv2.line(frame, (cx, cy), at(t, 1.0), (44, 49, 57), 1, cv2.LINE_AA)
+
+    tips = []
+    for i, t in enumerate(angs):
+        tip = at(t, float(np.clip(abs(coords[i]) / RADAR_FULL, 0, 1)))
+        tips.append(tip)
+        hot = float(np.clip(amps[i], 0, 1))
+        col = (60, 150, 235) if coords[i] >= 0 else (225, 150, 60)
+        col = tuple(int(c + (250 - c) * hot) for c in col)
+        cv2.line(frame, (cx, cy), tip, col, 2 if hot > 0.05 else 1, cv2.LINE_AA)
+        cv2.circle(frame, tip, 2, col, -1, cv2.LINE_AA)
+        lx, ly = at(t, 1.0 + 11.0 / R)
+        cv2.putText(frame, str(i + 1), (lx - 3, ly + 4), FONT, 0.32, DIM, 1, cv2.LINE_AA)
+
+    poly = np.array(tips, np.int32)
+    ov = frame.copy()
+    cv2.fillPoly(ov, [poly], (108, 84, 40))
+    cv2.addWeighted(ov, 0.38, frame, 0.62, 0, frame)
+    cv2.polylines(frame, [poly], True, (150, 190, 240), 1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 2, (200, 210, 220), -1, cv2.LINE_AA)
+    return frame
+
+
+def draw_hud(frame, knobs, mut_size, amps, coords, fps, scene, drift, saved):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h - PANEL), (w, h), (16, 13, 11), -1)
@@ -314,14 +362,11 @@ def draw_hud(frame, knobs, mut_size, amps, fps, scene, drift, saved):
                   (rx + 56 + int(120 * np.clip(mut_size / 2.0, 0, 1)), yy + 7),
                   (90, 170, 235), -1)
 
-    py = top + 60
-    cv2.putText(frame, "pads", (rx, py + 12), FONT, 0.36, DIM, 1, cv2.LINE_AA)
-    for i in range(N_PADS):
-        a = float(np.clip(amps[i], 0, 1))
-        col = (int(46 + 150 * a), int(42 + 90 * a), int(52 + 210 * a))
-        x = rx + 56 + (i % 4) * 31
-        yy = py + (i // 4) * 22
-        cv2.rectangle(frame, (x, yy), (x + 25, yy + 17), col, -1)
+    # how much of the latent now lives in the 8 directions the pads can reach
+    r8 = float(np.linalg.norm(coords))
+    cv2.putText(frame, f"8-cube  r {r8:.2f}", (rx, top + 52), FONT, 0.36,
+                (150, 190, 240), 1, cv2.LINE_AA)
+    draw_radar(frame, rx + 104, top + 122, coords, amps)
     return frame
 
 
@@ -364,8 +409,14 @@ def main():
 
     base = new_base()
     base_norm = base.float().norm()
-    latent_dirs = orthonormal_basis(N_PADS, shape, gen, device, dtype)
-    dir_norm = latent_dirs[0].float().norm()
+    def pad_basis():
+        """The pads' directions, plus unit copies for the radar to project onto."""
+        dirs = orthonormal_basis(N_PADS, shape, gen, device, dtype)
+        u = dirs.float().flatten(1)
+        return (dirs, dirs[0].float().norm(),
+                u / u.norm(dim=1, keepdim=True).clamp(min=1e-6))
+
+    latent_dirs, dir_norm, unit_dirs = pad_basis()
 
     def renorm(z):
         """Back onto the noise hypersphere. Mutations accumulate, and off the
@@ -416,7 +467,10 @@ def main():
                 frame = cv2.resize(frame, None, fx=a.scale, fy=a.scale,
                                    interpolation=cv2.INTER_LINEAR)
             if show_hud:
-                frame = draw_hud(frame, knobs, mut_size, amps, fps,
+                # direction cosines onto the pad axes - the radar's 8 coordinates
+                b0 = base[0].float().flatten()
+                coords = ((unit_dirs @ b0) / b0.norm().clamp(min=1e-6)).cpu().numpy()
+                frame = draw_hud(frame, knobs, mut_size, amps, coords, fps,
                                  SCENES[scene_i], drift, now < saved_until)
 
             cv2.imshow(win, frame)
@@ -427,7 +481,7 @@ def main():
                 base = new_base()
                 base_norm = base.float().norm()
             elif k == ord("n"):
-                latent_dirs = orthonormal_basis(N_PADS, shape, gen, device, dtype)
+                latent_dirs, dir_norm, unit_dirs = pad_basis()
             elif k == ord("c"):
                 midi.recentre()
             elif k == ord("-"):
