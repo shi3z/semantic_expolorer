@@ -11,8 +11,13 @@ number, every hit jumps a random distance either way along it, and the harder yo
 hit the further you go - so the image wanders somewhere new and stays there.
 Press r to start over from a fresh latent.
 
+Everything is a departure from a starting prompt. Pass one with --prompt, cycle
+the built-in list with [ and ], or press p and type a new one without stopping
+the stream.
+
     .venv/Scripts/python.exe midi_latent.py
     .venv/Scripts/python.exe midi_latent.py --width 384 --height 384   # ~26 fps
+    .venv/Scripts/python.exe midi_latent.py --prompt "a still life, oil on canvas"
 
 Knobs (left to right, after you have moved each one once):
     1 man <-> woman          4 busy <-> silent      7 japanese <-> western
@@ -28,9 +33,11 @@ centre is untouched noise, the rim is the wall of the 8-cube, and r is how much
 of the latent the pads have taken over.
 
 Keys in the window:
-    r  reset the latent         d  toggle drift        s  save frame
-    n  new pad directions       h  toggle HUD          [ / ]  prev / next scene
-    c  recentre knobs           - / =  mutation size   q / esc  quit
+    p  type a new prompt        d  toggle drift        s  save frame
+    r  reset the latent         h  toggle HUD          [ / ]  prev / next scene
+    n  new pad directions       - / =  mutation size   q / esc  quit
+    c  recentre knobs
+While typing: enter commits and switches to it, esc abandons, other keys are inert.
 """
 import argparse
 import os
@@ -55,7 +62,9 @@ from utils.wrapper import StreamDiffusionWrapper
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "outputs")
 
-# Scenes the axes act on. [ and ] cycle these.
+# Scenes the axes act on - the starting point everything else is a departure from.
+# [ and ] cycle these, --prompt puts your own at the front, and p types a new one
+# without stopping the stream.
 SCENES = [
     "a portrait photograph, natural light, highly detailed, 35mm",
     "a full body photograph, studio light, highly detailed",
@@ -323,7 +332,7 @@ def draw_radar(frame, cx, cy, coords, amps):
     return frame
 
 
-def draw_hud(frame, knobs, mut_size, amps, coords, fps, scene, drift, saved):
+def draw_hud(frame, knobs, mut_size, amps, coords, fps, scene, drift, saved, typing=None):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h - PANEL), (w, h), (16, 13, 11), -1)
@@ -336,8 +345,13 @@ def draw_hud(frame, knobs, mut_size, amps, coords, fps, scene, drift, saved):
     if tag:
         cv2.putText(frame, tag, (108, top + 20), FONT, 0.46,
                     (120, 235, 190), 1, cv2.LINE_AA)
-    text = scene if len(scene) <= 60 else scene[:57] + "..."
-    cv2.putText(frame, text, (14, top + 38), FONT, 0.38, DIM, 1, cv2.LINE_AA)
+    if typing is None:
+        text = scene if len(scene) <= 60 else scene[:57] + "..."
+        cv2.putText(frame, text, (14, top + 38), FONT, 0.38, DIM, 1, cv2.LINE_AA)
+    else:
+        # show the tail, so a long prompt still shows what you are typing
+        cv2.putText(frame, "> " + typing[-56:] + "_", (14, top + 38), FONT, 0.38,
+                    (120, 235, 190), 1, cv2.LINE_AA)
 
     # five bipolar semantic axes
     bar_x, bar_w, row_h = 92, 148, 17
@@ -388,6 +402,8 @@ def main():
     p.add_argument("--scale", type=float, default=1.5, help="window magnification")
     p.add_argument("--port", default=None, help="substring of the MIDI port name")
     p.add_argument("--seed", type=int, default=11)
+    p.add_argument("--prompt", default=None,
+                   help="starting scene; goes to the front of the [ ] list")
     a = p.parse_args()
 
     midi = Midi(a.port)
@@ -399,7 +415,8 @@ def main():
         mode="txt2img", use_denoising_batch=True, cfg_type="none",
         use_lcm_lora=False, use_tiny_vae=True, output_type="pt", seed=a.seed,
     )
-    stream.prepare(prompt=SCENES[0], num_inference_steps=50)
+    scenes = ([a.prompt] if a.prompt else []) + list(SCENES)
+    stream.prepare(prompt=scenes[0], num_inference_steps=50)
     sd = stream.stream
     batch = sd.batch_size
     shape = (4, sd.latent_height, sd.latent_width)
@@ -407,7 +424,7 @@ def main():
 
     print("semantic axes:")
     axes = axis_vectors(sd, batch)
-    scene_embs = [encode(sd, s, batch) for s in SCENES]
+    scene_embs = [encode(sd, s, batch) for s in scenes]
 
     gen = torch.Generator(device="cpu").manual_seed(a.seed)
 
@@ -436,6 +453,7 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
     scene_i, show_hud, drift, saved_until = 0, True, False, 0.0
+    typing = None            # not None while a new prompt is being typed
     mut_size = 1.0          # - and = adjust; all eight knobs are spoken for
     knobs = np.zeros(len(AXES), dtype=np.float32)
     fps, frames, t_fps = 0.0, 0, time.perf_counter()
@@ -498,18 +516,36 @@ def main():
             if a.scale != 1.0:
                 frame = cv2.resize(frame, None, fx=a.scale, fy=a.scale,
                                    interpolation=cv2.INTER_LINEAR)
-            if show_hud:
+            if show_hud or typing is not None:   # you have to see what you type
                 # direction cosines onto the pad axes - the radar's 8 coordinates.
                 # taken off the latent, not the base, so the knobs move it too
                 b0 = latent[0].float().flatten()
                 coords = ((unit_dirs @ b0) / b0.norm().clamp(min=1e-6)).cpu().numpy()
                 frame = draw_hud(frame, knobs, mut_size, amps, coords, fps,
-                                 SCENES[scene_i], drift, now < saved_until)
+                                 scenes[scene_i], drift, now < saved_until, typing)
 
             cv2.imshow(win, frame)
             k = cv2.waitKey(1) & 0xFF
-            if k in (ord("q"), 27):
+            if typing is not None:
+                # swallow everything while typing, or r would reset mid-word
+                if k == 13:                                   # enter - commit
+                    said = typing.strip()
+                    if said:
+                        scenes.append(said)
+                        scene_embs.append(encode(sd, said, batch))
+                        scene_i = len(scenes) - 1
+                        print(f"scene {scene_i}: {said}")
+                    typing = None
+                elif k == 27:                                 # esc - abandon
+                    typing = None
+                elif k == 8:                                  # backspace
+                    typing = typing[:-1]
+                elif 32 <= k <= 126:
+                    typing += chr(k)
+            elif k in (ord("q"), 27):
                 break
+            elif k == ord("p"):
+                typing = ""
             elif k == ord("r"):
                 base = new_base()
                 base_norm = base.float().norm()
@@ -527,9 +563,9 @@ def main():
             elif k == ord("h"):
                 show_hud = not show_hud
             elif k == ord("]"):
-                scene_i = (scene_i + 1) % len(SCENES)
+                scene_i = (scene_i + 1) % len(scenes)
             elif k == ord("["):
-                scene_i = (scene_i - 1) % len(SCENES)
+                scene_i = (scene_i - 1) % len(scenes)
             elif k == ord("s"):
                 os.makedirs(OUT, exist_ok=True)
                 path = os.path.join(OUT, f"midi_{int(time.time())}.png")
