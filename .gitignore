@@ -1,0 +1,19 @@
+# virtualenv
+.venv/
+
+# upstream StreamDiffusion is cloned, not vendored (see README setup)
+upstream/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# generated from report.html + measurements by build_report.py
+report_built.html
+
+# scratch generations; the calibration sheet and contact sheet are kept
+outputs/*
+!outputs/semantic_axes.png
+!outputs/contact_turbo.png
+!outputs/contact_turbo.jpg
+!outputs/lcm1_stream_0.png
