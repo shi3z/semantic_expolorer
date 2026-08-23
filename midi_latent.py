@@ -2,11 +2,14 @@
 
 All eight knobs are *semantic* axes: each is a direction in CLIP text-embedding
 space, built as the difference between two contrasting prompts and rescaled so every
-knob lands with comparable force. Turning a knob slides the image along that concept.
+knob lands with comparable force. Turning a knob slides the image along that concept,
+and steers the noise latent down the matching pad axis at the same time - absolutely,
+so recentring the knob undoes it. Nothing snaps: knobs and latent alike travel to
+their targets at a fixed speed.
 Pads mutate the base noise latent for good. Each pad owns the axis of the same
-number, every hit jumps a random distance along it, and the harder you hit the
-further you go - so the image wanders somewhere new and stays there. Press r to
-start over from a fresh latent.
+number, every hit jumps a random distance either way along it, and the harder you
+hit the further you go - so the image wanders somewhere new and stays there.
+Press r to start over from a fresh latent.
 
     .venv/Scripts/python.exe midi_latent.py
     .venv/Scripts/python.exe midi_latent.py --width 384 --height 384   # ~26 fps
@@ -109,6 +112,10 @@ MUT_CURVE = 1.5      # velocity exponent - soft taps nudge, hard hits leap
 MUT_JITTER = 0.7     # fresh randomness blended into the pad's own direction, so
                      # no two hits on the same pad ever land in the same place
 PAD_TAU = 0.35       # HUD flash decay, seconds - the mutation itself is permanent
+KNOB_LAT = 0.5       # how far a knob at full steers the latent along its own axis,
+                     # in base-latent norms - about one pad hit's worth
+KNOB_GLIDE = 3.0     # knob units per second travelled toward the target
+LAT_GLIDE = 1.6      # base-latent norms per second travelled toward the target
 DRIFT = 0.014        # random-walk step per frame when drift is on
 
 
@@ -268,7 +275,8 @@ def to_bgr(tensor):
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 PANEL = 204
 RADAR_R = 58         # radar radius, px
-RADAR_FULL = 0.5     # direction cosine drawn out at the rim
+RADAR_FULL = 0.6     # direction cosine drawn out at the rim; a long random walk
+                     # puts p99 at 0.55 and never quite reaches 0.61
 INK = (196, 206, 216)
 DIM = (132, 140, 150)
 
@@ -409,6 +417,7 @@ def main():
 
     base = new_base()
     base_norm = base.float().norm()
+    base_target = base.clone()   # pads move this; `base` slides after it
     def pad_basis():
         """The pads' directions, plus unit copies for the radar to project onto."""
         dirs = orthonormal_basis(N_PADS, shape, gen, device, dtype)
@@ -428,14 +437,20 @@ def main():
 
     scene_i, show_hud, drift, saved_until = 0, True, False, 0.0
     mut_size = 1.0          # - and = adjust; all eight knobs are spoken for
+    knobs = np.zeros(len(AXES), dtype=np.float32)
     fps, frames, t_fps = 0.0, 0, time.perf_counter()
+    t_prev = time.perf_counter()
     print("\nrunning - focus the image window for keys, ctrl-c here to stop\n")
 
     try:
         while True:
             now = time.perf_counter()
 
-            knobs = np.array([midi.knob(i) for i in range(len(AXES))], dtype=np.float32)
+            dt, t_prev = min(now - t_prev, 0.1), now
+
+            # nothing snaps: every value walks to its target at a fixed speed
+            want = np.array([midi.knob(i) for i in range(len(AXES))], dtype=np.float32)
+            knobs += np.clip(want - knobs, -KNOB_GLIDE * dt, KNOB_GLIDE * dt)
 
             amps = midi.pad_envelopes(now)
 
@@ -450,12 +465,29 @@ def main():
                 d = latent_dirs[slot] + MUT_JITTER * torch.randn(
                     shape, generator=gen, dtype=torch.float32).to(device, dtype)
                 d = d * (dir_norm / d.float().norm().clamp(min=1e-6))
-                base = renorm(base + (vel ** MUT_CURVE) * MUT_STEP * mut_size * d)
+                # which way along the axis is a coin flip, or the walk only ever
+                # climbs and you are stuck in one corner of the 8-cube
+                sgn = 1.0 if torch.rand((), generator=gen).item() < 0.5 else -1.0
+                base_target = renorm(base_target
+                                     + sgn * (vel ** MUT_CURVE) * MUT_STEP * mut_size * d)
 
             if drift:
-                base = renorm(base + DRIFT * torch.randn(base.shape, generator=gen,
-                                                         dtype=torch.float32).to(device, dtype))
+                base_target = renorm(base_target + DRIFT * torch.randn(
+                    base.shape, generator=gen, dtype=torch.float32).to(device, dtype))
+
+            # slide toward wherever the pads have put the target
+            step = base_target - base
+            far = float(step.float().norm())
+            if far > 1e-3:
+                base = renorm(base + step * min(1.0, LAT_GLIDE * dt * float(base_norm) / far))
+
+            # the knobs steer the latent as well as the prompt, along the same axis
+            # each pad jumps on - but absolutely, so centring a knob undoes it
             latent = base
+            for i, k in enumerate(knobs):
+                if abs(k) > 1e-3:
+                    latent = latent + (float(k) * KNOB_LAT) * latent_dirs[i]
+            latent = renorm(latent)
 
             frame = to_bgr(generate(sd, latent, emb.to(dtype)))
 
@@ -467,8 +499,9 @@ def main():
                 frame = cv2.resize(frame, None, fx=a.scale, fy=a.scale,
                                    interpolation=cv2.INTER_LINEAR)
             if show_hud:
-                # direction cosines onto the pad axes - the radar's 8 coordinates
-                b0 = base[0].float().flatten()
+                # direction cosines onto the pad axes - the radar's 8 coordinates.
+                # taken off the latent, not the base, so the knobs move it too
+                b0 = latent[0].float().flatten()
                 coords = ((unit_dirs @ b0) / b0.norm().clamp(min=1e-6)).cpu().numpy()
                 frame = draw_hud(frame, knobs, mut_size, amps, coords, fps,
                                  SCENES[scene_i], drift, now < saved_until)
@@ -480,6 +513,7 @@ def main():
             elif k == ord("r"):
                 base = new_base()
                 base_norm = base.float().norm()
+                base_target = base.clone()
             elif k == ord("n"):
                 latent_dirs, dir_norm, unit_dirs = pad_basis()
             elif k == ord("c"):
