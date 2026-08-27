@@ -14,6 +14,7 @@ report_built.html
 # scratch generations; the calibration sheet and contact sheet are kept
 outputs/*
 !outputs/semantic_axes.png
+!outputs/pad_mutation.png
 !outputs/contact_turbo.png
 !outputs/contact_turbo.jpg
 !outputs/lcm1_stream_0.png
